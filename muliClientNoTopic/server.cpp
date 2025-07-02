@@ -142,9 +142,14 @@ void handle_client(int client_socket)
             std::string response = "Message broadcasted";
             send(client_socket, response.c_str(), response.length(), 0);
         }
+        close(client_socket);
     }
-
-    close(client_socket);
+    else
+    {
+        std::cerr << "[SERVER] Unknown role: " << role << std::endl;
+        close(client_socket);
+        return;
+    }
 }
 
 int main(int argc, char *argv[])
