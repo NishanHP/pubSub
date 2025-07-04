@@ -65,8 +65,16 @@ int main(int argc, char *argv[])
 
     // Step 1: Send role to server first (with newline delimiter)
     string role_msg = role + "\n";
-    send(socket_fd, role_msg.c_str(), role_msg.length(), 0);
-    cout << "[CLIENT] Sent role: " << role << endl;
+    cout << "[CLIENT] Sending role: '" << role << "' with newline (total " << role_msg.length() << " bytes)" << endl;
+
+    int bytes_sent = send(socket_fd, role_msg.c_str(), role_msg.length(), 0);
+    if (bytes_sent != (int)role_msg.length())
+    {
+        cerr << "[CLIENT] Failed to send complete role message. Sent " << bytes_sent << " of " << role_msg.length() << " bytes" << endl;
+        close(socket_fd);
+        return 1;
+    }
+    cout << "[CLIENT] Successfully sent role: " << role << endl;
 
     // Step 2: Wait for role acknowledgment
     memset(buffer, 0, BUFFER_SIZE);
@@ -81,8 +89,16 @@ int main(int argc, char *argv[])
 
     // Step 3: Send topic to server (with newline delimiter)
     string topic_msg = topic + "\n";
-    send(socket_fd, topic_msg.c_str(), topic_msg.length(), 0);
-    cout << "[CLIENT] Sent topic: " << topic << endl;
+    cout << "[CLIENT] Sending topic: '" << topic << "' with newline (total " << topic_msg.length() << " bytes)" << endl;
+
+    bytes_sent = send(socket_fd, topic_msg.c_str(), topic_msg.length(), 0);
+    if (bytes_sent != (int)topic_msg.length())
+    {
+        cerr << "[CLIENT] Failed to send complete topic message. Sent " << bytes_sent << " of " << topic_msg.length() << " bytes" << endl;
+        close(socket_fd);
+        return 1;
+    }
+    cout << "[CLIENT] Successfully sent topic: " << topic << endl;
 
     // Step 4: Wait for final acknowledgment based on role
 

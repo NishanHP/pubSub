@@ -9,20 +9,25 @@
 #include <algorithm>
 #include <chrono>
 #include <signal.h>
+#include <sys/socket.h>
+#include <errno.h>
 
 #define BUFFER_SIZE 1024
+#define MAX_MESSAGE_LENGTH 4096
+#define MAX_TOPIC_LENGTH 256
+#define MAX_ROLE_LENGTH 64
 
 int server_fd = -1;
-bool server_running = true; // Flag to control server loop
+bool server_running = true;
 
 std::map<std::string, std::vector<int>> topic_subscribers;
 std::mutex topic_mutex;
 
 void cleanup(int sig)
 {
-    std::cout << "\n[SERVER] Received signal " << sig << ". Shutting down gracefully..." << std::endl;
+    std::cout << "\n[SERVER] Received signal " << sig << ". Shutting down..." << std::endl;
 
-    server_running = false; // Stop the accept loop
+    server_running = false;
 
     if (server_fd != -1)
     {
@@ -47,36 +52,133 @@ void cleanup(int sig)
     exit(0);
 }
 
-// Helper function to read from socket until delimiter is found
-std::string read_until_delimiter(int socket_fd, char delimiter = '\n')
+// Secure function to read until delimiter with length limits
+std::string read_until_delimiter(int socket_fd, char delimiter = '\n', size_t max_length = MAX_MESSAGE_LENGTH)
 {
     std::string result;
     char ch;
 
-    while (true)
+    // Reserve space to avoid frequent reallocations
+    result.reserve(std::min(max_length, static_cast<size_t>(256)));
+
+    std::cout << "[SERVER] Starting to read until delimiter '" << delimiter << "'" << std::endl;
+
+    while (result.length() < max_length)
     {
         int bytes_read = read(socket_fd, &ch, 1);
         if (bytes_read <= 0)
         {
             // Connection closed or error
+            std::cerr << "[SERVER] Read error or connection closed. Bytes read: " << bytes_read
+                      << ", errno: " << errno << " (" << strerror(errno) << ")" << std::endl;
+            std::cout << "[SERVER] Partial data received: '" << result << "'" << std::endl;
             return "";
         }
+
+        std::cout << "[SERVER] Read char: '" << ch << "' (0x" << std::hex << (unsigned char)ch << std::dec << ")" << std::endl;
 
         if (ch == delimiter)
         {
             // Found delimiter, return the accumulated string
+            std::cout << "[SERVER] Found delimiter, returning: '" << result << "'" << std::endl;
             break;
         }
 
-        result += ch;
+        // Only add printable characters and common whitespace (except delimiter)
+        if ((ch >= 32 && ch <= 126) || ch == '\t' || ch == '\r')
+        {
+            result += ch;
+        }
+        else
+        {
+            std::cout << "[SERVER] Ignoring non-printable character: 0x" << std::hex << (unsigned char)ch << std::dec << std::endl;
+        }
     }
 
+    // If we reached max_length without finding delimiter, it's suspicious
+    if (result.length() >= max_length)
+    {
+        std::cerr << "[SERVER] Warning: Message exceeded maximum length limit" << std::endl;
+        return "";
+    }
+
+    std::cout << "[SERVER] Final result: '" << result << "'" << std::endl;
     return result;
 }
 
-// Broadcast to every subscriber of a specific topic
+// Secure send function with error handling
+bool secure_send(int socket_fd, const std::string &message)
+{
+    if (message.empty() || message.length() > MAX_MESSAGE_LENGTH)
+    {
+        std::cerr << "[SERVER] Invalid message length for sending" << std::endl;
+        return false;
+    }
+
+    size_t total_sent = 0;
+    size_t message_len = message.length();
+    const char *data = message.c_str();
+
+    while (total_sent < message_len)
+    {
+        int bytes_sent = send(socket_fd, data + total_sent, message_len - total_sent, MSG_NOSIGNAL);
+        if (bytes_sent <= 0)
+        {
+            if (errno == EPIPE || errno == ECONNRESET)
+            {
+                std::cerr << "[SERVER] Client disconnected during send" << std::endl;
+            }
+            else
+            {
+                std::cerr << "[SERVER] Send error: " << strerror(errno) << std::endl;
+            }
+            return false;
+        }
+        total_sent += bytes_sent;
+    }
+
+    return true;
+}
+
+// Input validation function
+bool validate_input(const std::string &input, size_t max_length, const std::string &field_name)
+{
+    if (input.empty())
+    {
+        std::cerr << "[SERVER] Empty " << field_name << " received" << std::endl;
+        return false;
+    }
+
+    if (input.length() > max_length)
+    {
+        std::cerr << "[SERVER] " << field_name << " exceeds maximum length (" << max_length << ")" << std::endl;
+        return false;
+    }
+
+    // Check for valid characters (alphanumeric, underscore, hyphen, dot)
+    for (char c : input)
+    {
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.'))
+        {
+            std::cerr << "[SERVER] Invalid character in " << field_name << ": " << c << std::endl;
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void broadcast_to_subscribers(const std::string &topic, const std::string &message)
 {
+    // Validate inputs
+    if (!validate_input(topic, MAX_TOPIC_LENGTH, "topic") ||
+        message.empty() || message.length() > MAX_MESSAGE_LENGTH)
+    {
+        std::cerr << "[SERVER] Invalid topic or message for broadcasting" << std::endl;
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(topic_mutex);
     auto it = topic_subscribers.find(topic);
     if (it != topic_subscribers.end())
@@ -89,9 +191,8 @@ void broadcast_to_subscribers(const std::string &topic, const std::string &messa
             int subscriber_fd = *subscriber_it;
             // Send message with newline delimiter to maintain consistency
             std::string message_with_delimiter = message + "\n";
-            int byte_sent = send(subscriber_fd, message_with_delimiter.c_str(), message_with_delimiter.length(), 0);
 
-            if (byte_sent <= 0)
+            if (!secure_send(subscriber_fd, message_with_delimiter))
             {
                 std::cout << "[SERVER] Subscriber disconnected: " << subscriber_fd << std::endl;
                 close(subscriber_fd);
@@ -112,9 +213,14 @@ void broadcast_to_subscribers(const std::string &topic, const std::string &messa
 
 void add_subscriber(const std::string &topic, int subscriber_fd)
 {
+    if (!validate_input(topic, MAX_TOPIC_LENGTH, "topic"))
+    {
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(topic_mutex);
     topic_subscribers[topic].push_back(subscriber_fd);
-    std::cout << "[SERVER] Added subscriber " << subscriber_fd << std::endl;
+    std::cout << "[SERVER] Added subscriber " << subscriber_fd << " to topic: " << topic << std::endl;
 }
 
 void remove_subscriber(const std::string &topic, int subscriber_fd)
@@ -124,59 +230,63 @@ void remove_subscriber(const std::string &topic, int subscriber_fd)
     if (it != topic_subscribers.end())
     {
         it->second.erase(std::remove(it->second.begin(), it->second.end(), subscriber_fd), it->second.end());
-        std::cout << "[SERVER] Removed subscriber " << subscriber_fd << std::endl;
+        std::cout << "[SERVER] Removed subscriber " << subscriber_fd << " from topic: " << topic << std::endl;
     }
     else
     {
-        std::cout << "[SERVER] No subscriber found for the topic" << topic << std::endl;
+        std::cout << "[SERVER] No subscriber found for the topic: " << topic << std::endl;
     }
 }
 
 void handle_client(int client_fd)
 {
-    char buffer[BUFFER_SIZE];
-
-    // Step 1: Read role from client using delimiter
-    std::string role = read_until_delimiter(client_fd, '\n');
-    if (role.empty())
+    // Step 1: Read role from client using delimiter with length limit
+    std::string role = read_until_delimiter(client_fd, '\n', MAX_ROLE_LENGTH);
+    if (role.empty() || !validate_input(role, MAX_ROLE_LENGTH, "role"))
     {
-        std::cerr << "[SERVER] Error reading role from client or connection closed" << std::endl;
+        std::cerr << "[SERVER] Error reading role from client or invalid role" << std::endl;
         close(client_fd);
         return;
     }
 
-    std::cout << "[SERVER] Client role: '" << role << std::endl;
+    std::cout << "[SERVER] Client role: '" << role << "'" << std::endl;
 
     // Step 2: Send acknowledgment for role
-    std::string role_ack = "ROLE_ACK";
-    if (send(client_fd, role_ack.c_str(), role_ack.length(), 0) <= 0)
+    std::string role_ack = "ROLE_ACK\n";
+    if (!secure_send(client_fd, role_ack))
     {
         std::cerr << "[SERVER] Failed to send role acknowledgment" << std::endl;
         close(client_fd);
         return;
     }
 
-    // Step 3: Read topic from client using delimiter
-    std::string topic = read_until_delimiter(client_fd, '\n');
-    if (topic.empty())
+    // Step 3: Read topic from client using delimiter with length limit
+    std::string topic = read_until_delimiter(client_fd, '\n', MAX_TOPIC_LENGTH);
+    if (topic.empty() || !validate_input(topic, MAX_TOPIC_LENGTH, "topic"))
     {
-        std::cerr << "[SERVER] Error reading topic from client or connection closed" << std::endl;
+        std::cerr << "[SERVER] Error reading topic from client or invalid topic" << std::endl;
         close(client_fd);
         return;
     }
 
-    std::cout << "[SERVER] Client topic: '" << topic << std::endl;
+    std::cout << "[SERVER] Client topic: '" << topic << "'" << std::endl;
 
     // Step 4: Send acknowledgment for topic and proceed based on role
     if (role == "subscriber")
     {
         add_subscriber(topic, client_fd);
 
-        std::string sub_ack = "SUBSCRIBER_READY";
-        send(client_fd, sub_ack.c_str(), sub_ack.length(), 0);
+        std::string sub_ack = "SUBSCRIBER_READY\n";
+        if (!secure_send(client_fd, sub_ack))
+        {
+            std::cerr << "[SERVER] Failed to send subscriber acknowledgment" << std::endl;
+            remove_subscriber(topic, client_fd);
+            close(client_fd);
+            return;
+        }
 
         // Keep subscriber connection alive
-        while (server_running) // Check server status
+        while (server_running)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -201,13 +311,18 @@ void handle_client(int client_fd)
     {
         std::cout << "[SERVER] Publisher connected for topic: " << topic << std::endl;
 
-        std::string pub_ack = "PUBLISHER_READY";
-        send(client_fd, pub_ack.c_str(), pub_ack.length(), 0);
+        std::string pub_ack = "PUBLISHER_READY\n";
+        if (!secure_send(client_fd, pub_ack))
+        {
+            std::cerr << "[SERVER] Failed to send publisher acknowledgment" << std::endl;
+            close(client_fd);
+            return;
+        }
 
         // Handle publisher messages
-        while (true)
+        while (server_running)
         {
-            std::string message = read_until_delimiter(client_fd, '\n');
+            std::string message = read_until_delimiter(client_fd, '\n', MAX_MESSAGE_LENGTH);
             if (message.empty())
             {
                 std::cout << "[SERVER] Publisher disconnected from topic: " << topic << std::endl;
@@ -220,16 +335,20 @@ void handle_client(int client_fd)
             broadcast_to_subscribers(topic, message);
 
             // Send acknowledgment back to publisher
-            std::string response = "MESSAGE_BROADCASTED";
-            send(client_fd, response.c_str(), response.length(), 0);
+            std::string response = "MESSAGE_BROADCASTED\n";
+            if (!secure_send(client_fd, response))
+            {
+                std::cout << "[SERVER] Failed to send acknowledgment to publisher" << std::endl;
+                break;
+            }
         }
 
         close(client_fd);
     }
     else
     {
-        std::string error_msg = "UNKNOWN_ROLE";
-        send(client_fd, error_msg.c_str(), error_msg.length(), 0);
+        std::string error_msg = "UNKNOWN_ROLE\n";
+        secure_send(client_fd, error_msg);
         std::cout << "[SERVER] Unknown role: " << role << std::endl;
         close(client_fd);
     }
@@ -244,13 +363,37 @@ int main(int argc, char *argv[])
     }
 
     const char *ip = argv[1];
-    int port = std::stoi(argv[2]);
+
+    // Validate IP address format
+    struct sockaddr_in sa;
+    int ip_valid = inet_pton(AF_INET, ip, &(sa.sin_addr));
+    if (ip_valid != 1)
+    {
+        std::cerr << "Invalid IP address format: " << ip << std::endl;
+        return 1;
+    }
+
+    int port;
+    try
+    {
+        port = std::stoi(argv[2]);
+        if (port <= 0 || port > 65535)
+        {
+            std::cerr << "Invalid port number. Must be between 1 and 65535." << std::endl;
+            return 1;
+        }
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Invalid port number: " << argv[2] << std::endl;
+        return 1;
+    }
 
     signal(SIGINT, cleanup);
+    signal(SIGTERM, cleanup);
 
     int client_socket;
     struct sockaddr_in server_addr;
-    char buffer[BUFFER_SIZE];
     socklen_t addr_len = sizeof(server_addr);
 
     // Create socket and assign to global server_fd
@@ -262,6 +405,10 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    // tells the kernel we want to reuse the address
+    //  This is useful for development to avoid "Address already in use" errors
+    //  when restarting the server quickly.
+    //  This is doing by SO_REUSEADDR option.
     int opt = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
     {
@@ -270,6 +417,18 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    // To user kernel load balancer
+    // Note: this does not reinitiate connection that lost. only the server instance available
+    // Client have to reconnect to the server manually.
+    // if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0)
+    // {
+    //     perror("setsockopt failed");
+    //     close(server_fd);
+    //     return 1;
+    // }
+
+    // Initialize server address structure
+    memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = inet_addr(ip);
     server_addr.sin_port = htons(port);
@@ -290,19 +449,19 @@ int main(int argc, char *argv[])
 
     std::cout << "[SERVER] Listening on " << ip << ":" << port << std::endl;
 
-    while (server_running) // Use flag instead of true
+    while (server_running)
     {
         client_socket = accept(server_fd, (struct sockaddr *)&server_addr, &addr_len);
         if (client_socket < 0)
         {
-            if (server_running) // Only show error if server is still running
+            if (server_running)
             {
                 perror("accept failed");
             }
             continue;
         }
 
-        if (!server_running) // Check flag after accept
+        if (!server_running)
         {
             close(client_socket);
             break;
