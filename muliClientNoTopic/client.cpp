@@ -1,116 +1,101 @@
+// test_client.cpp
 #include <iostream>
+#include <string>
 #include <cstring>
 #include <unistd.h>
 #include <arpa/inet.h>
 
-#define BUFFER_SIZE 1024
-
-using namespace std;
-
 int main(int argc, char *argv[])
 {
-    string ip = argv[1];
-    int port = atoi(argv[2]);
-    string role = argv[3];
-
     if (argc != 4)
     {
-        cout << "Usage: ./client <IP> <Port> <Role>" << endl;
+        std::cerr << "Usage: " << argv[0] << " <server_ip> <server_port> <role>" << std::endl;
+        std::cerr << "Role: 'subscriber' or 'publisher'" << std::endl;
         return 1;
     }
 
-    if (strcasecmp("publisher", role.c_str()) != 0 && strcasecmp("subscriber", role.c_str()) != 0)
-    {
-        cerr << "Invalid role. Use 'publisher' or 'subscriber'." << endl;
-        return 1;
-    }
+    const char *server_ip = argv[1];
+    int server_port = std::stoi(argv[2]);
+    std::string role = argv[3];
 
-    if (port < 1024 || port > 65535)
-    {
-        cerr << "Port number must be between 1024 and 65535." << endl;
-        return 1;
-    }
-
-    // variable declaration
-    int socket_fd;
-    struct sockaddr_in serv_addr;
-    char buffer[BUFFER_SIZE];
-
-    socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (socket_fd < 0)
+    int client_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (client_fd < 0)
     {
         perror("socket creation failed");
         return 1;
     }
 
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = inet_addr(server_ip);
+    server_addr.sin_port = htons(server_port);
 
-    if (inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr) <= 0)
+    if (connect(client_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
     {
-        cerr << "Invalid address" << endl;
+        perror("connection failed");
+        close(client_fd);
         return 1;
     }
 
-    if (connect(socket_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
+    std::cout << "[CLIENT] Connected to server" << std::endl;
+
+    // Send role
+    std::string role_msg = role + "\n";
+    send(client_fd, role_msg.c_str(), role_msg.length(), 0);
+    std::cout << "[CLIENT] Sent role: " << role << std::endl;
+
+    // Wait for acknowledgment
+    char buffer[1024];
+    int bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
+    if (bytes_read > 0)
     {
-        perror("Connection failed");
-        cout << "Trying to connect to " << ip << ":" << port << endl;
-        return 1;
+        buffer[bytes_read] = '\0';
+        std::cout << "[CLIENT] Server response: " << buffer;
     }
 
-    cout << "[CLIENT] Successfully connected to server" << endl;
-
-    // Send role to server first
-    send(socket_fd, role.c_str(), role.length(), 0);
-
-    if (strcasecmp("publisher", role.c_str()) == 0)
+    if (role == "subscriber")
     {
-        // Read server acknowledgment
-        memset(buffer, 0, BUFFER_SIZE);
-        read(socket_fd, buffer, BUFFER_SIZE - 1);
-        cout << "[CLIENT] " << buffer << endl;
-
+        std::cout << "[CLIENT] Waiting for messages..." << std::endl;
         while (true)
         {
-            string message;
-            cout << "Enter message to send: ";
-            getline(cin, message);
-
-            if (strcmp(message.c_str(), "exit") == 0)
-            {
-                cout << "Exiting client" << endl;
-                break;
-            }
-            send(socket_fd, message.c_str(), message.length(), 0);
-
-            // Read server response
-            memset(buffer, 0, BUFFER_SIZE);
-            int bytes_read = read(socket_fd, buffer, BUFFER_SIZE - 1);
-            if (bytes_read > 0)
-            {
-                cout << "[CLIENT] Server response: " << buffer << endl;
-            }
-        }
-    }
-    else
-    {
-        cout << "[CLIENT] Subscriber connected" << endl;
-        memset(buffer, 0, BUFFER_SIZE);
-        while (true)
-        {
-            int bytes_read = read(socket_fd, buffer, BUFFER_SIZE - 1);
+            bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
             if (bytes_read <= 0)
             {
-                std::cerr << "[CLIENT] Server disconnected" << std::endl;
-                break; // Exit the loop if server disconnects
+                std::cout << "[CLIENT] Disconnected from server" << std::endl;
+                break;
             }
-            buffer[bytes_read] = '\0'; // Null-terminate the string
-            std::cout << "[CLIENT] Received: " << buffer << std::endl;
-            memset(buffer, 0, BUFFER_SIZE); // Clear the buffer for the next read
+            buffer[bytes_read] = '\0';
+            std::cout << "[CLIENT] Received: " << buffer;
+        }
+    }
+    else if (role == "publisher")
+    {
+        std::string message;
+        while (true)
+        {
+            std::cout << "[CLIENT] Enter message (or 'quit' to exit): ";
+            std::getline(std::cin, message);
+
+            if (message == "quit")
+            {
+                break;
+            }
+
+            std::string msg_with_newline = message + "\n";
+            send(client_fd, msg_with_newline.c_str(), msg_with_newline.length(), 0);
+            std::cout << "[CLIENT] Sent: " << message << std::endl;
+
+            // Wait for acknowledgment
+            bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
+            if (bytes_read > 0)
+            {
+                buffer[bytes_read] = '\0';
+                std::cout << "[CLIENT] Server response: " << buffer;
+            }
         }
     }
 
-    close(socket_fd);
+    close(client_fd);
     return 0;
 }
